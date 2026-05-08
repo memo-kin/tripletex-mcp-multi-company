@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tripletex": {
+      "command": "<REPO_ROOT>/venv/Scripts/python.exe",
+      "args": ["<REPO_ROOT>/mcp/tripletex_server.py"]
+    }
+  }
+}

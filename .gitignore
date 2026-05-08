@@ -1,0 +1,25 @@
+# Secrets and credentials
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+.mcp.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Downloaded invoice PDFs
+invoices/
