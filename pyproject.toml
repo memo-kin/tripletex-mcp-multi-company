@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tripletex-mcp-multi-company"
+version = "0.1.0"
+description = "Read-only MCP server for the Tripletex accounting API v2, multi-company aware. Runs locally (stdio) or hosted (streamable-http)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Memo Dervishogullari" }]
+dependencies = [
+    "fastmcp==2.11.3",
+    "httpx==0.28.1",
+    "python-dotenv==1.1.1",
+]
+
+[project.scripts]
+tripletex-mcp-multi = "tripletex_mcp_multi.__main__:main"
+tripletex-mcp-multi-client = "tripletex_mcp_multi.client:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tripletex_mcp_multi"]

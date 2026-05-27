@@ -1,0 +1,84 @@
+# Cloud Build pipeline for tripletex-mcp-multi-company.
+#
+# Triggers on git tags matching `v*` (configure via Cloud Build trigger).
+# Builds the image, pushes to Artifact Registry, and deploys a new Cloud Run
+# revision with --no-traffic so promotion is a manual `gcloud run services
+# update-traffic` step.
+#
+# Set the substitutions below on your Cloud Build trigger (do NOT commit real
+# values — this is a public repo):
+#   _PROJECT_ID  → the GCP project hosting Cloud Run / Artifact Registry
+#   _AR_REPO     → the Artifact Registry repo name (e.g. "mcp")
+#   _REGION      → e.g. "europe-west1"
+#   _SERVICE     → the Cloud Run service name (e.g. "tripletex-mcp-multi")
+#
+# Required Secret Manager secrets (see README for setup):
+#   tripletex-consumer-token   → exposes as env TRIPLETEX_CONSUMER_TOKEN
+#   tripletex-companies        → JSON blob, exposes as env TRIPLETEX_COMPANIES
+#   tripletex-base-url         → exposes as env TRIPLETEX_BASE_URL (prod vs test)
+
+substitutions:
+  _PROJECT_ID: "<YOUR_GCP_PROJECT_ID>"
+  _AR_REPO: "<YOUR_ARTIFACT_REGISTRY_REPO>"
+  _REGION: "europe-west1"
+  _SERVICE: "tripletex-mcp-multi"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --tag
+      - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE}:${TAG_NAME}
+      - --tag
+      - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE}:latest
+      - .
+
+  - id: push-tag
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE}:${TAG_NAME}
+
+  - id: push-latest
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE}:latest
+
+  # Cloud Run revision tags only allow [a-z0-9-] and must start with a letter,
+  # so we sanitize ${TAG_NAME} (e.g. "v0.1.0" → "rev-v0-1-0") in-shell before
+  # invoking gcloud run deploy. The "$$" escapes keep Cloud Build from treating
+  # the bash vars as its own substitutions.
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        revtag="rev-$$(echo "${TAG_NAME}" | tr '.' '-' | tr '[:upper:]' '[:lower:]')"
+        echo "Deploying revision with tag: $$revtag"
+        gcloud run deploy ${_SERVICE} \
+          --image=${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE}:${TAG_NAME} \
+          --region=${_REGION} \
+          --platform=managed \
+          --no-allow-unauthenticated \
+          --no-traffic \
+          --tag="$$revtag" \
+          --port=8080 \
+          --cpu=1 \
+          --memory=512Mi \
+          --concurrency=20 \
+          --timeout=300 \
+          --min-instances=0 \
+          --max-instances=4 \
+          --set-env-vars=MCP_TRANSPORT=streamable-http \
+          --set-secrets=TRIPLETEX_CONSUMER_TOKEN=tripletex-consumer-token:latest,TRIPLETEX_COMPANIES=tripletex-companies:latest,TRIPLETEX_BASE_URL=tripletex-base-url:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE}:${TAG_NAME}
+  - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE}:latest

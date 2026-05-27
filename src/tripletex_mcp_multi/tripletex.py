@@ -1,4 +1,8 @@
-"""Tripletex authentication and API helpers (sync + async)."""
+"""Tripletex authentication and async API helper.
+
+Ported from the canonical implementation in kinberg-terminal. Only the async
+code paths are kept here — this server is async-only.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,6 @@ import asyncio
 import json
 import os
 import re
-import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -27,70 +30,12 @@ def build_params(**kwargs: Any) -> dict[str, Any]:
     return {_to_camel(k): v for k, v in kwargs.items() if v is not None}
 
 
-# ---------------------------------------------------------------------------
-# Sync auth (used by pipeline)
-# ---------------------------------------------------------------------------
-
-
-class TripletexAuthSync:
-    """Sync session token manager for Tripletex."""
-
-    def __init__(
-        self,
-        client: httpx.Client,
-        consumer_token: str,
-        employee_token: str,
-        base_url: str,
-    ) -> None:
-        self._client = client
-        self._consumer_token = consumer_token
-        self._employee_token = employee_token
-        self._base_url = base_url
-        self._session_token: str | None = None
-        self._expiration_date: date | None = None
-
-    @property
-    def base_url(self) -> str:
-        return self._base_url
-
-    def get_token(self) -> str:
-        if self._is_expired():
-            self._create_session()
-        return self._session_token  # type: ignore[return-value]
-
-    def force_refresh(self) -> str:
-        self._create_session()
-        return self._session_token  # type: ignore[return-value]
-
-    def _is_expired(self) -> bool:
-        if self._session_token is None or self._expiration_date is None:
-            return True
-        today = datetime.now(timezone.utc).date()
-        return today >= self._expiration_date
-
-    def _create_session(self) -> None:
-        expiration = (datetime.now(timezone.utc) + timedelta(days=2)).date().isoformat()
-        resp = self._client.put(
-            f"{self._base_url}/token/session/:create",
-            params={
-                "consumerToken": self._consumer_token,
-                "employeeToken": self._employee_token,
-                "expirationDate": expiration,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        self._session_token = data["value"]["token"]
-        self._expiration_date = date.fromisoformat(expiration)
-
-
-# ---------------------------------------------------------------------------
-# Async auth (used by MCP server)
-# ---------------------------------------------------------------------------
-
-
 class TripletexAuthAsync:
-    """Async session token manager for Tripletex."""
+    """Async session token manager for Tripletex.
+
+    Exchanges (consumer_token, employee_token) for a short-lived session token
+    via PUT /token/session/:create and caches it until expiry.
+    """
 
     def __init__(
         self,
@@ -141,11 +86,6 @@ class TripletexAuthAsync:
         self._expiration_date = date.fromisoformat(expiration)
 
 
-# ---------------------------------------------------------------------------
-# Multi-company registry (used by MCP server)
-# ---------------------------------------------------------------------------
-
-
 class CompanyRegistry:
     """Holds per-company TripletexAuthAsync instances."""
 
@@ -176,7 +116,10 @@ class CompanyRegistry:
 
     def get_auth(self, company: str | None) -> TripletexAuthAsync:
         if self.count == 0:
-            raise ValueError("No Tripletex companies configured. Set TRIPLETEX_COMPANIES or TRIPLETEX_EMPLOYEE_TOKEN.")
+            raise ValueError(
+                "No Tripletex companies configured. "
+                "Set TRIPLETEX_COMPANIES or TRIPLETEX_EMPLOYEE_TOKEN."
+            )
 
         if company is None:
             if self.company_required:
@@ -192,11 +135,6 @@ class CompanyRegistry:
                 f"Unknown company '{company}'. Available: {', '.join(self._names)}"
             )
         return self._auths[key]
-
-
-# ---------------------------------------------------------------------------
-# Company loader (shared)
-# ---------------------------------------------------------------------------
 
 
 def load_tripletex_companies(consumer_token: str, base_url: str) -> list[dict[str, str]]:
@@ -226,70 +164,6 @@ def load_tripletex_companies(consumer_token: str, base_url: str) -> list[dict[st
         ]
 
     return []
-
-
-# ---------------------------------------------------------------------------
-# Sync API helper (used by pipeline)
-# ---------------------------------------------------------------------------
-
-
-def tripletex_get_sync(
-    client: httpx.Client,
-    auth: TripletexAuthSync,
-    path: str,
-    params: dict | None = None,
-    max_results: int = DEFAULT_MAX_RESULTS,
-) -> list[dict]:
-    """Paginated GET against Tripletex. Returns the data list."""
-    params = dict(params or {})
-    token = auth.get_token()
-    base_auth = httpx.BasicAuth(username="0", password=token)
-
-    params.setdefault("count", PAGE_SIZE)
-    params.setdefault("from", 0)
-
-    all_values: list[dict] = []
-    total_available: int | None = None
-    retried_auth = False
-
-    while True:
-        resp = client.get(f"{auth.base_url}{path}", params=params, auth=base_auth)
-
-        if resp.status_code == 401 and not retried_auth:
-            retried_auth = True
-            token = auth.force_refresh()
-            base_auth = httpx.BasicAuth(username="0", password=token)
-            continue
-
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", "2"))
-            time.sleep(retry_after)
-            continue
-
-        resp.raise_for_status()
-        body = resp.json()
-
-        if "value" in body and "values" not in body:
-            return [body["value"]]
-
-        values = body.get("values", [])
-        total_available = body.get("fullResultSize", len(values))
-        all_values.extend(values)
-
-        if len(all_values) >= max_results:
-            return all_values[:max_results]
-        if len(all_values) >= total_available:
-            break
-
-        params["from"] = len(all_values)
-        retried_auth = False
-
-    return all_values
-
-
-# ---------------------------------------------------------------------------
-# Async API helper (used by MCP server)
-# ---------------------------------------------------------------------------
 
 
 async def tripletex_get_async(

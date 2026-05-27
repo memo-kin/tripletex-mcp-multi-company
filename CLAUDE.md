@@ -2,46 +2,66 @@
 
 ## What This Is
 
-A standalone, read-only MCP server for the **Tripletex** REST API v2 with multi-company support. One server process can authenticate against and serve data from any number of Tripletex companies; the caller selects which company per tool call via a `company` parameter.
+A read-only MCP server for the **Tripletex** REST API v2 with multi-company support. One process can
+authenticate against and serve data from any number of Tripletex companies; the caller selects which
+company per tool call via a `company` parameter. Packaged so it runs **locally over stdio** or
+**hosted over streamable-http** (e.g. Google Cloud Run) from the same code.
+
+> **Public, MIT-licensed repo.** Never commit proprietary values — GCP project ids, live service
+> URLs, real emails, or any token. Deployment files use `<PLACEHOLDER>` substitutions; secrets live
+> in `.env` (gitignored) or a secret manager.
+
+## Hard invariants — do not violate
+
+- **Read-only.** Never add Tripletex mutation tools (POST/PUT/DELETE). Wrap GET only.
+- **No app-level auth.** When hosted, the platform (Cloud Run IAM) is the only client→server auth.
+  Don't add bearer/API-key middleware or token validation in the app.
+- **No proprietary values in the repo.** Keep `cloudbuild.yaml`/`client.py`/`smoke.ps1`/`README`
+  placeholders generic; real values go on the Cloud Build trigger or in env.
+- **Pinned deps.** Exact versions in `pyproject.toml`. Bumps are deliberate.
+- **FastMCP 2.x.** Use `ctx.request_context.lifespan_context[...]`; the older `ctx.lifespan_context`
+  raises `AttributeError` at runtime.
+- **PDF tools stay transport-aware.** stdio writes to `./output/`; http returns inline base64. Keep
+  the split — don't unify the return shape.
 
 ## How to Run
 
-**MCP server:** Auto-launched via `.mcp.json` (restart Claude Code to reload after code changes).
-
-**Setup:** `python -m venv venv && pip install -r requirements.txt` + `.env` with API credentials.
-
-**Standalone smoke test:** `python mcp/tripletex_server.py` — speaks stdio, blocks waiting for MCP messages. Traceback at startup = misconfigured env/imports.
+- **Local stdio (dev):** `pip install -e .`, copy `.env.example`→`.env` (test tenant), then
+  `python -m tripletex_mcp_multi --stdio`. `.mcp.json` (copied from `.mcp.json.example`) auto-registers
+  the `tripletex-dev` server. Restart Claude Code after `src/` edits — FastMCP doesn't hot-reload.
+- **Hosted http:** `python -m tripletex_mcp_multi` defaults to streamable-http on `:$PORT/mcp`. Built
+  by `Dockerfile`, deployed by `cloudbuild.yaml` on `v*` tags. End users connect through the
+  `tripletex-mcp-multi-client` stdio proxy. See `README.md` for the full release loop.
 
 ## Project Structure
 
 ```
 tripletex-mcp-multi-company/
-├── .env / .mcp.json / requirements.txt / LICENSE
-├── auth/                    # Sync + async Tripletex auth + multi-company registry
-│   ├── __init__.py
-│   └── tripletex.py
-├── mcp/                     # MCP server (standalone script, no __init__.py)
-│   └── tripletex_server.py  # 19 tools, multi-company aware
-└── agent_docs/              # Deep reference docs (see below)
-    └── mcp_tripletex.md
+├── pyproject.toml / Dockerfile / cloudbuild.yaml / .dockerignore
+├── .env.example / .mcp.json.example / .python-version / LICENSE
+├── scripts/smoke.ps1            # post-deploy verification (init + tools/list + whoami)
+├── src/tripletex_mcp_multi/
+│   ├── __main__.py              # transport switch (stdio vs streamable-http; env MCP_TRANSPORT)
+│   ├── server.py                # FastMCP instance + 23 @mcp.tool() definitions
+│   ├── tripletex.py             # TripletexAuthAsync, CompanyRegistry, tripletex_get_async (paginator)
+│   └── client.py                # end-user stdio proxy → hosted HTTPS; gcloud-token refresh
+└── agent_docs/mcp_tripletex.md  # deep reference (API surface, pagination, tool-by-tool behavior)
 ```
 
-## Architecture
-
-- **`auth/tripletex.py`**: Auth + `CompanyRegistry`. Provides both sync (script) and async (MCP) flavors. `load_tripletex_companies()` reads `TRIPLETEX_COMPANIES` (JSON array) or falls back to a single-company `TRIPLETEX_EMPLOYEE_TOKEN`. Each entry in `TRIPLETEX_COMPANIES` may optionally override `consumer_token` and `base_url`.
-- **`mcp/tripletex_server.py`**: Standalone FastMCP server. No `__init__.py` in `mcp/` — that would shadow the pip `mcp` package. The script adds the project root to `sys.path` to import from `auth/`. Default `TRIPLETEX_BASE_URL` is the Tripletex test environment (`https://api-test.tripletex.tech/v2`); set it explicitly to switch to production.
+Console scripts (from `pyproject.toml`): `tripletex-mcp-multi` (server) and
+`tripletex-mcp-multi-client` (proxy). Auth is **async-only** (no sync flavor).
 
 ## Multi-company calling convention
 
-Every tool that touches company-specific data accepts an optional `company` parameter:
-
-- If only one company is configured, `company` may be omitted.
-- If multiple are configured, `company` is **required** — the server raises rather than silently picking one.
-- The value must match a `name` you configured in `TRIPLETEX_COMPANIES`.
+- One company configured → `company` may be omitted.
+- Multiple configured → `company` is **required**; the server raises rather than guessing.
+- The value must match a `name` from `TRIPLETEX_COMPANIES`. `list_companies` enumerates them.
 
 ## Querying gotchas
 
-**Tripletex `date_to` is exclusive.** Every tool that takes `date_to` (or `invoice_date_to`) drops entries dated on `date_to` itself. For an inclusive period query, pass the **first day of the next period**:
+**Tripletex `date_to` is exclusive.** Every tool that takes `date_to` (or `invoice_date_to` /
+`order_date_to`) drops entries dated on `date_to` itself. For an inclusive period, pass the **first day
+of the next period**:
 
 | Period | date_from | date_to |
 |--------|-----------|---------|
@@ -49,8 +69,11 @@ Every tool that touches company-specific data accepts an optional `company` para
 | Q1 2026 | `2026-01-01` | `2026-04-01` |
 | Full year 2025 | `2025-01-01` | `2026-01-01` |
 
-This matters most for the income statement: month-end COGS recognition, inventory adjustments, and accrual vouchers are typically dated to the last day of the month, so `date_to=last-day-of-month` silently drops them and can flip a profit into a loss.
+This matters most for the income statement: month-end COGS recognition, inventory adjustments, and
+accrual vouchers are typically dated to the last day of the month, so `date_to=last-day-of-month`
+silently drops them and can flip a profit into a loss.
 
 ## Deep Reference
 
-Before modifying server code, read `agent_docs/mcp_tripletex.md` — it covers the API surface, pagination, rate limits, and tool-by-tool behavior.
+Before modifying server code, read `agent_docs/mcp_tripletex.md` — API surface, pagination, rate
+limits, transport-aware PDFs, and tool-by-tool behavior.
